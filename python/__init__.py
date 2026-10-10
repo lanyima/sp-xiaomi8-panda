@@ -131,7 +131,14 @@ class Panda:
 
   # from https://github.com/commaai/openpilot/blob/103b4df18cbc38f4129555ab8b15824d1a672bdf/cereal/log.capnp#L648
   HW_TYPE_UNKNOWN = b'\x00'
+  HW_TYPE_WHITE_PANDA = b'\x01'
+  HW_TYPE_GREY_PANDA = b'\x02'
+  HW_TYPE_BLACK_PANDA = b'\x03'
+  HW_TYPE_PEDAL = b'\x04'
+  HW_TYPE_UNO = b'\x05'
+  HW_TYPE_DOS = b'\x06'
   HW_TYPE_RED_PANDA = b'\x07'
+  HW_TYPE_RED_PANDA_V2 = b'\x08'
   HW_TYPE_TRES = b'\x09'
   HW_TYPE_CUATRO = b'\x0a'
   HW_TYPE_BODY = b'\xb1'
@@ -139,12 +146,19 @@ class Panda:
   CAN_PACKET_VERSION = compute_version_hash(os.path.join(opendbc.INCLUDE_PATH, "opendbc/safety/can.h"))
   HEALTH_PACKET_VERSION = compute_version_hash(os.path.join(BASEDIR, "board/health.h"))
   HEALTH_STRUCT = _parse_c_struct(os.path.join(BASEDIR, "board/health.h"), "health_t")
+  # xiaomi8: black panda (F4, DEV firmware) uses old 58-byte health struct
+  F4_HEALTH_STRUCT = struct.Struct("<IIIIIIIIBBBBBHBBBHfBBHBHHB")
   CAN_HEALTH_STRUCT = struct.Struct("<BIBBBBBBBBIIIIIIIHHBBBIIII")
 
-  H7_DEVICES = [HW_TYPE_RED_PANDA, HW_TYPE_TRES, HW_TYPE_CUATRO, HW_TYPE_BODY]
+  F4_DEVICES = [HW_TYPE_WHITE_PANDA, HW_TYPE_GREY_PANDA, HW_TYPE_BLACK_PANDA, HW_TYPE_UNO, HW_TYPE_DOS]
+  H7_DEVICES = [HW_TYPE_RED_PANDA, HW_TYPE_RED_PANDA_V2, HW_TYPE_TRES, HW_TYPE_CUATRO, HW_TYPE_BODY]
+  # xiaomi8: 黑熊(F4)必须【不】在 SUPPORTED_DEVICES —— 否则 pandad 的 check_panda_support 判它"支持"
+  # → 走到 panda.flash()(黑熊 DEV 签名 ≠ 期望 F4 签名)→ 刷失败 → recover → 把好黑熊打进 bootstub
+  # (3801:ddee)→ 界面"panda未识别". sp2025 就是 =H7_DEVICES: 黑熊被跳过刷写、用自带固件、交 C++
+  # ./pandad 流CAN+设安全模型. F4_DEVICES 仍保留供 get_type/bcd 识别, 只是不当"要管理/要刷"的设备.
   SUPPORTED_DEVICES = H7_DEVICES
 
-  INTERNAL_DEVICES = (HW_TYPE_TRES, HW_TYPE_CUATRO)
+  INTERNAL_DEVICES = (HW_TYPE_DOS, HW_TYPE_TRES, HW_TYPE_CUATRO)
 
   HARNESS_STATUS_NC = 0
   HARNESS_STATUS_NORMAL = 1
@@ -207,14 +221,21 @@ class Panda:
     self._handle = None
     while self._handle is None:
       # try USB first, then SPI
-      self._context, self._handle, serial, self.bootstub = self.usb_connect(self._connect_serial, claim=claim, no_error=wait)
+      self._context, self._handle, serial, self.bootstub, bcd = self.usb_connect(self._connect_serial, claim=claim, no_error=wait)
       if self._handle is None:
-        self._context, self._handle, serial, self.bootstub = self.spi_connect(self._connect_serial)
+        self._context, self._handle, serial, self.bootstub, bcd = self.spi_connect(self._connect_serial)
       if not wait:
         break
 
     if self._handle is None:
       raise Exception("failed to connect to panda")
+
+    self._bcd_hw_type = None
+    ret = self._handle.controlRead(Panda.REQUEST_IN, 0xc1, 0, 0, 0x40)
+    missing_hw_type_endpoint = self.bootstub and isinstance(ret, (bytes, bytearray)) and ret.startswith(b'\xff\x00\xc1\x3e\xde\xad\xd0\x0d')
+    if missing_hw_type_endpoint and bcd is not None:
+      self._bcd_hw_type = bcd
+    self._assume_f4_mcu = missing_hw_type_endpoint and self._bcd_hw_type is None
 
     self._serial = serial
     self._connect_serial = serial
@@ -248,7 +269,7 @@ class Panda:
       handle = PandaSpiHandle()
       dat = handle.get_protocol_version()
     except PandaSpiException:
-      return None, None, None, False
+      return None, None, None, False, None
 
     spi_serial = binascii.hexlify(dat[:12]).decode()
     pid = dat[13]
@@ -259,18 +280,18 @@ class Panda:
 
     # did we get the right panda?
     if serial is not None and spi_serial != serial:
-      return None, None, None, False
+      return None, None, None, False, None
 
     # ensure our protocol version matches the panda
     if (not ignore_version) and spi_version != handle.PROTOCOL_VERSION:
       raise PandaProtocolMismatch(f"panda protocol mismatch: expected {handle.PROTOCOL_VERSION}, got {spi_version}. reflash panda")
 
     # got a device and all good
-    return None, handle, spi_serial, bootstub
+    return None, handle, spi_serial, bootstub, None
 
   @classmethod
   def usb_connect(cls, serial, claim=True, no_error=False):
-    handle, usb_serial, bootstub = None, None, None
+    handle, usb_serial, bootstub, bcd = None, None, None, None
     context = usb1.USBContext()
     context.open()
     try:
@@ -296,6 +317,10 @@ class Panda:
               handle.claimInterface(0)
               # handle.setInterfaceAltSetting(0, 0)  # Issue in USB stack
 
+            this_bcd = device.getbcdDevice()
+            if this_bcd is not None and this_bcd != 0x2300:
+              bcd = bytearray([this_bcd >> 8])
+
             break
     except Exception:
       logger.exception("USB connect error")
@@ -306,7 +331,7 @@ class Panda:
     else:
       context.close()
 
-    return context, usb_handle, usb_serial, bootstub
+    return context, usb_handle, usb_serial, bootstub, bcd
 
   def is_connected_spi(self):
     return isinstance(self._handle, PandaSpiHandle)
@@ -316,10 +341,11 @@ class Panda:
 
   @classmethod
   def list(cls, usb_only: bool = False):
-    ret = cls.usb_list()
+    ret = []
     if not usb_only:
       ret += cls.spi_list()
-    return list(set(ret))
+    ret += cls.usb_list()
+    return list(dict.fromkeys(ret))
 
   @classmethod
   def usb_list(cls):
@@ -342,7 +368,7 @@ class Panda:
 
   @classmethod
   def spi_list(cls):
-    _, _, serial, _ = cls.spi_connect(None, ignore_version=True)
+    _, _, serial, _, _ = cls.spi_connect(None, ignore_version=True)
     if serial is not None:
       return [serial, ]
     return []
@@ -431,13 +457,14 @@ class Panda:
 
   def flash(self, fn=None, code=None, reconnect=True):
     assert (hw_type := self.get_type()) in self.SUPPORTED_DEVICES, f"Unknown HW: {hw_type}"
+    mcu_type = self.get_mcu_type()
 
     if self.up_to_date(fn=fn):
       logger.info("flash: already up to date")
       return
 
     if not fn:
-      fn = os.path.join(FW_PATH, McuType.H7.config.app_fn)
+      fn = os.path.join(FW_PATH, mcu_type.config.app_fn)
     assert os.path.isfile(fn)
     logger.debug("flash: main version is %s", self.get_version())
     if not self.bootstub:
@@ -452,7 +479,7 @@ class Panda:
     logger.debug("flash: bootstub version is %s", self.get_version())
 
     # do flash
-    Panda.flash_static(self._handle, code, mcu_type=McuType.H7)
+    Panda.flash_static(self._handle, code, mcu_type=mcu_type)
 
     # reconnect
     if reconnect:
@@ -503,7 +530,7 @@ class Panda:
   def up_to_date(self, fn=None) -> bool:
     current = self.get_signature()
     if fn is None:
-      fn = os.path.join(FW_PATH, McuType.H7.config.app_fn)
+      fn = os.path.join(FW_PATH, self.get_mcu_type().config.app_fn)
     expected = Panda.get_signature_from_firmware(fn)
     return (current == expected)
 
@@ -514,6 +541,41 @@ class Panda:
 
   @ensure_health_packet_version
   def health(self):
+    # xiaomi8: black panda (F4) uses old 58-byte health struct
+    if self.get_mcu_type() == McuType.F4:
+      dat = self._handle.controlRead(Panda.REQUEST_IN, 0xd2, 0, 0, self.F4_HEALTH_STRUCT.size)
+      a = self.F4_HEALTH_STRUCT.unpack(dat)
+      return {
+        "uptime": a[0],
+        "voltage": a[1],
+        "current": a[2],
+        "safety_tx_blocked": a[3],
+        "safety_rx_invalid": a[4],
+        "tx_buffer_overflow": a[5],
+        "rx_buffer_overflow": a[6],
+        "faults": a[7],
+        "ignition_line": a[8],
+        "ignition_can": a[9],
+        "controls_allowed": a[10],
+        "car_harness_status": a[11],
+        "safety_mode": a[12],
+        "safety_param": a[13],
+        "fault_status": a[14],
+        "power_save_enabled": a[15],
+        "heartbeat_lost": a[16],
+        "alternative_experience": a[17],
+        "interrupt_load": a[18],
+        "fan_power": a[19],
+        "safety_rx_checks_invalid": a[20],
+        "spi_error_count": a[21],
+        "sbu1_voltage_mV": a[22],
+        "sbu2_voltage_mV": a[23],
+        "som_reset_triggered": a[24],
+        "sound_output_level": 0,
+        "controls_allowed_lateral": bool(a[10]),
+        "controls_allowed_longitudinal": bool(a[10]),
+        "temperature": 0,
+      }
     dat = self._handle.controlRead(Panda.REQUEST_IN, 0xd2, 0, 0, self.HEALTH_STRUCT.size)
     a = self.HEALTH_STRUCT.unpack(dat)
     return {
@@ -543,8 +605,9 @@ class Panda:
       "sbu2_voltage_mV": a[23],
       "som_reset_triggered": a[24],
       "sound_output_level": a[25],
-      "controls_allowed_lateral": a[26],
-      "controls_allowed_longitudinal": a[27],
+      "controls_allowed_lateral": a[26] & 1,
+      "controls_allowed_longitudinal": (a[26] >> 1) & 1,
+      "temperature": a[27],
     }
 
   @ensure_health_packet_version
@@ -607,7 +670,12 @@ class Panda:
     return bytes(part_1 + part_2)
 
   def get_type(self):
-    return self._handle.controlRead(Panda.REQUEST_IN, 0xc1, 0, 0, 0x40)
+    ret = self._handle.controlRead(Panda.REQUEST_IN, 0xc1, 0, 0, 0x40)
+    if self._bcd_hw_type is not None and (ret is None or len(ret) != 1):
+      ret = self._bcd_hw_type
+    if isinstance(ret, bytearray):
+      return bytes(ret)
+    return ret
 
   def get_packets_versions(self):
     dat = self._handle.controlRead(Panda.REQUEST_IN, 0xdd, 0, 0, 8)
@@ -617,6 +685,16 @@ class Panda:
 
   def is_internal(self):
     return self.get_type() in Panda.INTERNAL_DEVICES
+
+  def get_mcu_type(self) -> McuType:
+    hw_type = self.get_type()
+    if hw_type in Panda.F4_DEVICES:
+      return McuType.F4
+    if hw_type in Panda.H7_DEVICES:
+      return McuType.H7
+    if self._assume_f4_mcu:
+      return McuType.F4
+    raise ValueError(f"unknown HW type: {hw_type}")
 
   def get_serial(self):
     """
@@ -635,7 +713,7 @@ class Panda:
     return self._serial
 
   def get_dfu_serial(self):
-    return PandaDFU.st_serial_to_dfu_serial(self._serial, McuType.H7)
+    return PandaDFU.st_serial_to_dfu_serial(self._serial, self.get_mcu_type())
 
   def get_uid(self):
     """
